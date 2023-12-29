@@ -1,0 +1,132 @@
+import java.util.concurrent.TimeUnit
+pipeline {   
+    agent {
+            label('code-k8s-agent')
+    }	
+    parameters {
+		string (name: 'ANVIL_TENANT_ID', defaultValue: '', description: 'Anvil tenant identifier')
+		string (name: 'JAVA_CLI_OPTIONS', defaultValue: '-h', description: 'Java CLI options/arguments for Anvil automation')
+		string (name: 'AKS_CLUSTER_RESOURCE_GROUP', defaultValue: '', description: 'AKS cluster resource group name')
+		string (name: 'AKS_CLUSTER', defaultValue: '', description: 'AKS cluster name')
+		string (name: 'AZURE_TENANT_ID', defaultValue: 'ceaa63aa-5d5c-4c7d-94b0-02f9a3ab6a8c', description: 'Azure tenant identifier')
+		string (name: 'ANVIL_ADLS_RESOURCE_GROUP', defaultValue: '', description: 'Anvil ADLS container resource group')
+		password (name: 'ANVIL_ADLS_ACCOUNT_KEY', defaultValue: '', description: 'Anvil ADLS account key')
+		string (name: 'ANVIL_ADLS_ACCOUNT_NAME', defaultValue: '', description: 'Anvil ADLS account name')
+		string (name: 'ANVIL_ADLS_CONTAINER_NAME', defaultValue: '', description: 'Anvil ADLS container Name')
+		string (name: 'KEYVAULT_NAME', defaultValue: '', description: 'Azure key-vault name')
+		password (name: 'USER_MANAGED_IDENTITY', defaultValue: '', description: 'User managed-identity that has access to AKS and key-vault')
+		string (name: 'K8S_NAMESPACE', defaultValue: '', description: 'Kubernetes namespace for k8s resources deployment')
+		string (name: 'DOCKER_IMAGE_TAG', defaultValue: '', description: 'Anvil docker image tag')
+		string (name: 'GIT_RELEASE_TAG', defaultValue: '', description: 'Umbrella repo. GIT Release Branch/Tag/Commit-Id')
+		string (name: 'K8S_JOB_WAIT_TIME', defaultValue: '10', description: 'K8s job run wait time(mins) to fetch the logs')
+		string (name: 'K8S_JOB_SUFFIX', defaultValue: "${TimeUnit.MILLISECONDS.toSeconds(System.currentTimeMillis())}", description: 'K8s job suffix')
+		booleanParam(name: 'K8S_VOLS_DEPLOY', defaultValue: false, description: 'Deploy K8s CSI volumes(once per environment)')
+		booleanParam(name: 'ANVIL_BATCH_RUN', defaultValue: true, description: 'Deploy K8s job to run Anvil automation')
+		choice(name: 'ANVIL_ENVIRONMENT', choices: ['dev', 'tst', 'dmo','sbx'], description: 'Short-form of the Anvil environment')
+		choice(name: 'ARTIFACTORY_REPO', choices: ['dev', 'release'], description: 'Artifactory repo for docker image')
+		string (name: 'AZURE_SUBSCRIPTION', defaultValue: 'sb-hi-dev', description: 'Azure subscription where cluster and other resources are deployed')
+		string (name: 'META_SVC_BATCH_ID', defaultValue: '<batch-id>', description: 'Metadata svc batch id')
+    }    
+    stages {		
+        stage ('GIT Checkout') {
+            steps {
+				withCredentials([usernamePassword(credentialsId: 'f-anvil-deploy-github-api-key', usernameVariable: 'fn_username', passwordVariable: 'fn_password')]) {
+					sh 'if [ -d "anvil-umbrella" ]; then rm -r anvil-umbrella; fi'    
+					sh "git clone --branch ${GIT_RELEASE_TAG} --single-branch  https://fn_username:${fn_password}@github.com/hibiscus-anvil/anvil-umbrella.git"
+					sh 'ls -lrth'
+				}   
+            }
+        }		
+        stage ('Login to Azure') {
+                steps {
+                    script {
+                        withCredentials([azureServicePrincipal('hibiscus-anvil-ci')]) {
+                            sh 'az login --service-principal -u $AZURE_CLIENT_ID -p=$AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID -o none'
+                        }
+                    }
+                }
+            }
+        stage ('Update HELM Values') {
+            steps {
+				script {
+					if (params.K8S_VOLS_DEPLOY) {
+						echo 'Update HELM values for chart - anvil-env-deploy'
+						dir('anvil-umbrella/anvil-core/anvil-env-deploy/chart/anvil-env-deploy') {
+							sh '''
+								set +x
+								ls -lrth
+								yq -i e '.storageKey = "'`echo ${ANVIL_ADLS_ACCOUNT_KEY} | base64 -w 0`'" | .storageName = "'`echo ${ANVIL_ADLS_ACCOUNT_NAME} | base64`'" | .namespace = "'${K8S_NAMESPACE}'" | .storageAccount = "'${ANVIL_ADLS_ACCOUNT_NAME}'" | .resourceGroup = "'${ANVIL_ADLS_RESOURCE_GROUP}'" | .userAssignedIdentity = "'${USER_MANAGED_IDENTITY}'" | .keyVaultName = "'${KEYVAULT_NAME}'" | .tenantID = "'${ANVIL_TENANT_ID}'" | .environment = "'${ANVIL_ENVIRONMENT}'" |  .anvilContainerName = "'${ANVIL_ADLS_CONTAINER_NAME}'" |   .azureTenantID = "'${AZURE_TENANT_ID}'" | .artifactoryRepo = "'${ARTIFACTORY_REPO}'"'  values.yaml                           
+							'''
+						}
+					}					
+					if (params.ANVIL_BATCH_RUN) {
+						echo 'Update HELM values for chart - anvil-batch'
+						dir('anvil-umbrella/anvil-core/anvil-env-deploy/chart/anvil-batch') {
+							sh '''  
+								set +x
+								ls -lrth
+								echo "This is java cli ${JAVA_CLI_OPTIONS}"
+								yq -i e '.jobSuffix = "'${K8S_JOB_SUFFIX}'" |  .azureTenantID = "'${AZURE_TENANT_ID}'" | .tenantID = "'${ANVIL_TENANT_ID}'" |  .imageTag = "'${DOCKER_IMAGE_TAG}'" | .namespace = "'${K8S_NAMESPACE}'" | .storageAccount = "'${ANVIL_ADLS_ACCOUNT_NAME}'" |  .anvilContainerName = "'${ANVIL_ADLS_CONTAINER_NAME}'" | .keyVaultName = "'${KEYVAULT_NAME}'" | .environment = "'${ANVIL_ENVIRONMENT}'" | .artifactoryRepo = "'${ARTIFACTORY_REPO}'" | .metaSvcBatchID = "'${META_SVC_BATCH_ID}'"'  values.yaml
+								sed -i "s/^javaOptions:.*/javaOptions: '${JAVA_CLI_OPTIONS}'/" values.yaml;
+							'''
+						}
+					}
+				}
+            }
+        }
+		stage ('Create namespace and artifactory secret') {
+            steps {
+                script {
+                dir('anvil-umbrella/anvil-core/anvil-env-deploy/chart/') { 
+                withCredentials([azureServicePrincipal('hibiscus-anvil-ci')]) {
+                    sh '''
+						az login --service-principal -u $AZURE_CLIENT_ID -p=$AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID -o none
+						az account set --subscription "${AZURE_SUBSCRIPTION}"
+                        az aks get-credentials --resource-group "${AKS_CLUSTER_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" --overwrite-existing
+                        kubelogin convert-kubeconfig -l spn --client-id $AZURE_CLIENT_ID --client-secret $AZURE_CLIENT_SECRET                        
+                        if [ "${K8S_VOLS_DEPLOY}" = "true" ] 
+                            then
+                                echo 'Create Kubernetes CSI ADLS volume and CSI Azure key-vault secret-provider resources' 
+                                kubectl create namespace "${K8S_NAMESPACE}" --dry-run=client -o yaml |  kubectl apply -f -
+                                helm3 upgrade --install anvil-env-"${ANVIL_TENANT_ID}" anvil-env-deploy --namespace "${K8S_NAMESPACE}"
+                            fi;
+                    '''
+                }
+				withCredentials([usernamePassword(credentialsId: 'f-anvil-deploy-artifactory', usernameVariable: 'username', passwordVariable: 'password')]) {
+					sh '''
+                        if [ -z "$(kubectl get secret anvil-artifactory-secret -n ${K8S_NAMESPACE})" ]; then
+                        	echo "no artifactory secret, creating ...."
+                        	kubectl create secret docker-registry --dry-run=client -o yaml anvil-artifactory-secret   --docker-server=artifactory.commops.merative.com  --docker-username=$username --docker-password=$password --docker-email=pchawda@merative.com --namespace ${K8S_NAMESPACE} |  kubectl apply -f -
+                        fi
+					'''
+				}
+                }
+            }                
+            }
+        }
+        stage ('HELM Deployment') {
+            steps {
+				script {
+                dir('anvil-umbrella/anvil-core/anvil-env-deploy/chart/') {                    
+                    withCredentials([azureServicePrincipal('hibiscus-anvil-ci')]) {
+                        sh '''
+						    set +x
+                            az login --service-principal -u $AZURE_CLIENT_ID -p=$AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID -o none
+                            az aks get-credentials --resource-group "${AKS_CLUSTER_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" --overwrite-existing
+                            kubelogin convert-kubeconfig -l spn --client-id $AZURE_CLIENT_ID --client-secret $AZURE_CLIENT_SECRET                  
+                            if [ "${ANVIL_BATCH_RUN}" = "true" ] 
+                            then
+                                echo 'Create Kubernetes job resource' 
+                                helm3 upgrade --install anvil-batch-"${ANVIL_TENANT_ID}" anvil-batch --namespace "${K8S_NAMESPACE}"
+								kubectl config set-context --current --namespace="${K8S_NAMESPACE}"
+                                kubectl wait --for=condition=ready pod -l job-name="hibi-${ANVIL_ENVIRONMENT}-job-${ANVIL_TENANT_ID}-${K8S_JOB_SUFFIX}" --timeout="${K8S_JOB_WAIT_TIME}m" || echo "Job pods didn't run within configured wait time - ${K8S_JOB_WAIT_TIME} minute(s)."								
+                                echo "Streaming Kubernetes job logs:"
+                                kubectl logs -f "job/hibi-${ANVIL_ENVIRONMENT}-job-${ANVIL_TENANT_ID}-${K8S_JOB_SUFFIX}"
+                            fi;                            
+                        '''
+                    }                                        
+                }               
+            }
+        }   }     
+    }
+}
