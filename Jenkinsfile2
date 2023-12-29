@@ -1,0 +1,409 @@
+
+import java.util.concurrent.TimeUnit
+
+pipeline {
+    agent {
+       node {
+             label "code-k8s-agent"
+       }
+    }
+    
+	
+    options {
+        timestamps()
+    }
+    environment {
+        triggered_by = "${(BUILD_USER_ID != null)} ? ${BUILD_USER_ID} : GIT_TRIGGER"
+        taskname = "ci-quick-task"
+        taskRunName = "${BUILD_NUMBER}"
+        stepname = "git-sync"
+        GIT_CREDS = credentials("${ACCOUNT_NAME}-github-api-key")
+        gitUsr = "${GIT_CREDS_USR}"
+        gitApiKey = "${GIT_CREDS_PSW}"
+        //injecting artifactory credentials
+        ARTIFACTORY_CREDS = credentials("${ACCOUNT_NAME}-artifactory")
+        ARTIFACTORY_USER = "${ARTIFACTORY_CREDS_USR}"
+        ARTIFACTORY_PASS = "${ARTIFACTORY_CREDS_PSW}"
+        
+        AZ_CREDS = credentials("${ACCOUNT_NAME}-azure")
+        AZ_APPLICATION_ID = "${AZ_CREDS_USR}"
+        AZ_APPLICATION_SECRET = "${AZ_CREDS_PSW}"
+        revision = "revision"
+        ENV_NAME = "DEVCI"
+        sha = "${sha}"
+        apiurl="${apiurl}"
+        basebranch="master"
+        prnum="${prnum}"
+        PATH = "${PATH}:/var/sidecar_shared_vol/"
+   }   
+    
+	parameters {
+      string (defaultValue: 'main', description: 'Git branch name of anvil content repo - for normal dev builds use main', name: 'GIT_BRANCH_NAME_CONTENT') 
+      string (name: 'GIT_BRANCH_NAME_UMBRELLA', defaultValue: 'anvil-dev', description: 'Umbrella repo - Git Release Branch/Tag/Commit-Id - for normal dev builds use anvil-dev') 
+      string (name: 'GIT_BRANCH_NAME_CORE', defaultValue: 'main', description: 'Git branch name of anvil core repo - for normal dev builds use main')
+      string (defaultValue: 'test-1', description: 'CONTENT_VERSION - name of the content zip to be saved or used in Artifactory', name: 'CONTENT_VERSION') 
+      string (name: 'JAR_VERSION', defaultValue: 'test-1', description: 'JAR_VERSION - Version of the core JAR to be saved or used in Artifactory')
+      booleanParam(name: 'DISABLE_AUTO_BUILD', defaultValue: false, description: 'TRUE to disable JAR build, FALSE to build the JAR')  
+      
+      choice(name: 'ANVIL_ENVIRONMENT', choices: ['anvil-dev', 'dev', 'release'], description: 'Anvil environment - Kyvos environment to run on')
+	  string (name: 'ANVIL_TENANT_ID', defaultValue: '2000', description: 'Anvil tenant identifier - please select your personal tenant')		 
+	  string (name: 'DOCKER_IMAGE_TAG', defaultValue: 'test-1', description: 'DOCKER_IMAGE_TAG - Version of the Anvil docker image tag to be saved or used in Artifactory')	  
+	  booleanParam(name: 'K8S_VOLS_DEPLOY', defaultValue: false, description: 'Deploy K8s CSI volumes (once per environment)')
+	  string (name: 'K8S_JOB_SUFFIX', defaultValue: "${TimeUnit.MILLISECONDS.toSeconds(System.currentTimeMillis())}", description: 'K8s job suffix - do not change')
+	  
+      booleanParam(name: 'content', defaultValue: false, description: 'Select this to create and push a content ZIP to Artifactory')
+      booleanParam(name: 'ci', defaultValue: false, description: 'Select this to create and push a core JAR to Artifactory and create a Docker image')
+      booleanParam(name: 'imagetag', defaultValue: false, description: 'Select this to correctly tag the newly created Docker image')
+      booleanParam(name: 'cd', defaultValue: false, description: 'Select this for deploy older images or the new image in Kyvos')
+    }
+
+    stages {
+        stage("pre-docker-build") {
+            
+            steps {
+              script {
+                if(params.ci) {
+                def gitVars = git branch: "${GIT_BRANCH_NAME_CORE}", url: "${USER_GIT_REPO}", credentialsId: "${ACCOUNT_NAME}-github-api-key"
+
+                if (env.DISABLE_RESYNC_COMMONS) {
+                   echo "DISABLE_RESYNC_COMMONS is set to 'true', using local whc-commons.tar"
+                   sh " tar -xf /whc-commons.tar -C /whc-commons/ "
+                }else{
+                  sh "rm -rf /whc-commons/* && rm -rf /whc-commons/.* || true "
+                  def whc_commons_org = "https://github.com/"+env.WHC_COMMONS_ORG.trim()+"/whc-commons"
+
+                  def commons_exists = fileExists '/whc-commons'
+                  if (!commons_exists){
+                        new File('/whc-commons').mkdir()
+                  }
+                  dir ('/whc-commons') {
+                     git branch: "${WHC_COMMONS_BRANCH}", url: whc_commons_org, credentialsId: "${ACCOUNT_NAME}-github-api-key"
+                  }
+                }
+         withEnv(["GIT_URL=${gitVars.GIT_URL}","GIT_BRANCH=${gitVars.GIT_LOCAL_BRANCH}","GIT_COMMIT=${gitVars.GIT_COMMIT}"]) {
+
+                sh '''#!/bin/bash -e
+                    echo "Starting pre-docker-build stage."
+                    echo "Running: /whc-commons/scripts/ci-predockerbuild.sh CIQUICK"
+                    bash /whc-commons/scripts/job-wrapper.sh "bash /whc-commons/scripts/ci-predockerbuild.sh CIQUICK"
+                    echo "Ending pre-docker-build stage."
+                '''.stripIndent()
+         }
+                 }
+              }
+            }
+            
+        }
+	
+	stage("unit-test") {
+            
+            steps {
+                script {
+            
+                    if(params.ci) {
+                        sh '''#!/bin/bash -e
+                            echo "Starting unit-test stage."
+                            echo "Running: /whc-commons/scripts/ci-predockerbuild.sh CIQUICK"
+                            bash /whc-commons/scripts/job-wrapper.sh "bash /whc-commons/scripts/runTestcase.wrapper.sh run-unittests.sh unittest.xml unittest"
+                            echo "Ending unit-test stage."
+                        '''.stripIndent()
+                }
+            }
+            }
+            
+        }
+	
+        stage("pre-build-check") {
+            
+            steps {
+                script{
+                    if(params.ci) {
+                        sh '''#!/bin/bash -e
+                            echo "Starting pre-build-check stage."
+                            echo "Running: /whc-commons/scripts/build_precheck.sh"
+                            bash /whc-commons/scripts/job-wrapper.sh "bash /whc-commons/scripts/build_precheck.sh"
+                            echo "Ending pre-build-check stage."
+                        '''.stripIndent()
+                    }
+                }
+            }    
+        
+        }
+		stage ('Content') {
+            
+            steps {
+                script{
+                    if (params.content) {
+                        withCredentials([usernamePassword(credentialsId: 'f-anvil-deploy-github-api-key', passwordVariable: 'pchawda_mcloud_pass', usernameVariable: 'pchawda_mcloud')]) 
+                        {
+                        sh '''
+                        rm -rf anvil-content
+                        rm -rf anvil
+                        rm -rf file.zip
+                        git clone --single-branch -b "${GIT_BRANCH_NAME_CONTENT}"  https://f-merative-devops_mcloud:${pchawda_mcloud_pass}@github.com/hibiscus-anvil/anvil-content.git
+                        ls -lrth
+						sudo yum -y install zip
+                        mkdir anvil
+                        mv -vf anvil-content/* anvil                        
+                        mkdir -p anvil-content/metadata
+                        mkdir -p anvil-content/kyvos-dashboards                        
+                        mv -vf anvil/metadata/* anvil-content/metadata
+                        mv -vf anvil/kyvos-dashboards/* anvil-content/kyvos-dashboards
+                        zip -r file.zip ./anvil-content
+                        ls -lrth
+                '''
+                        }
+
+                        echo "======================Login to Artifactory and push content=============================" 
+
+                        withCredentials([usernamePassword(credentialsId: 'f-anvil-deploy-artifactory', passwordVariable: 'pchawda_art_pass', usernameVariable: 'pchawda_art')]) 
+                        {
+                        sh "sudo docker login artifactory.commops.merative.com -u ${pchawda_art} -p ${pchawda_art_pass}"
+                        sh 'curl -u ${pchawda_art}:${pchawda_art_pass} -X PUT "https://artifactory.commops.merative.com/artifactory/hibisanvil-dev-maven-local/com/merative/anvil/anvil-content/"${CONTENT_VERSION}"/anvil-content-"${CONTENT_VERSION}".zip" -T ./file.zip'
+                        echo '==================Content zip has been pushed to artifactory, you can find it here https://artifactory.commops.merative.com/artifactory/hibisanvil-dev-maven-local/com/merative/anvil/anvil-content/'
+                        
+                        }            
+                }
+                }
+            }
+        }
+
+        stage("build-docker-image") {
+            
+            steps {
+                script{
+                    if(params.ci) {
+                    sh '''#!/bin/bash -e
+                        echo "Starting build-docker-image stage."
+                        echo "Running: /whc-commons/scripts/build_image.sh"
+                        bash /whc-commons/scripts/job-wrapper.sh "bash /whc-commons/scripts/build_image.sh"
+                        echo "Ending build-docker-image stage."
+                    '''.stripIndent()
+                }
+                }
+            }
+         }
+		 
+	    stage("source-scan") {
+            
+            steps {
+                script{
+                if(params.ci) {
+                sh '''#!/bin/bash -e
+                    echo "Starting source-scan stage."
+                    echo "Running: /whc-commons/scripts/scan/run-scan.sh"
+                    bash /whc-commons/scripts/job-wrapper.sh "bash /whc-commons/scripts/scan/run-scan.sh"
+                    echo "Ending source-scan stage."
+                '''.stripIndent()
+            }
+                }
+            }
+        }
+		stage('ImageTag') 
+        {
+            
+            steps {
+                script{
+                    if(params.imagetag) {
+                    withCredentials([usernamePassword(credentialsId: 'f-anvil-deploy-artifactory', passwordVariable: 'pchawda_art_pass', usernameVariable: 'pchawda_art')]) 
+                        {
+                        sh '''
+                        sudo docker login artifactory.commops.merative.com -u ${pchawda_art} -p ${pchawda_art_pass}
+                        sudo docker pull artifactory.commops.merative.com/hibisanvil-docker-local/"${ANVIL_ENVIRONMENT}"/anvilcore/"${DOCKER_IMAGE_TAG}":latest
+                        sudo docker tag artifactory.commops.merative.com/hibisanvil-docker-local/"${ANVIL_ENVIRONMENT}"/anvilcore/"${DOCKER_IMAGE_TAG}":latest artifactory.commops.merative.com/hibisanvil-docker-local/"${ANVIL_ENVIRONMENT}"/anvilcore:"${DOCKER_IMAGE_TAG}"
+                        sudo docker push artifactory.commops.merative.com/hibisanvil-docker-local/"${ANVIL_ENVIRONMENT}"/anvilcore:"${DOCKER_IMAGE_TAG}"
+                        '''
+                        }  
+                    }
+                }
+            }
+        }
+        
+        
+		stage ('CD') {
+            steps {
+                script{
+                    if (params.cd) {                
+                        withCredentials([usernamePassword(credentialsId: 'f-anvil-deploy-github-api-key', usernameVariable: 'fn_username', passwordVariable: 'fn_password')]) {
+                            sh 'if [ -d "anvil-umbrella" ]; then rm -r anvil-umbrella; fi'    
+                            sh "git clone --branch ${GIT_BRANCH_NAME_UMBRELLA} --single-branch  https://fn_username:${fn_password}@github.com/hibiscus-anvil/anvil-umbrella.git"
+                            sh 'ls -lrth'
+                        }   
+                
+                }
+                }
+            }
+        }
+		
+        stage ('Update HELM Values') {
+            steps {
+                script{
+                if (params.cd) {
+                    script {
+                        if (params.K8S_VOLS_DEPLOY) {
+                            echo 'Update HELM values for chart - anvil-env-deploy'
+                            dir('anvil-umbrella/anvil-core/anvil-env-deploy/chart/anvil-env-deploy') {
+                                sh '''
+                                    set +x
+                                    ls -lrth
+                                    yq -i e '.storageKey = "'`echo ${ANVIL_ADLS_ACCOUNT_KEY} | base64 -w 0`'" | .storageName = "'`echo ${ANVIL_ADLS_ACCOUNT_NAME} | base64`'" | .namespace = "'${K8S_NAMESPACE}'" | .storageAccount = "'${ANVIL_ADLS_ACCOUNT_NAME}'" | .resourceGroup = "'${ANVIL_ADLS_RESOURCE_GROUP}'" | .userAssignedIdentity = "'${USER_MANAGED_IDENTITY}'" | .keyVaultName = "'${KEYVAULT_NAME}'" | .tenantID = "'${ANVIL_TENANT_ID}'" | .environment = "'${ANVIL_ENVIRONMENT}'" |  .anvilContainerName = "'${ANVIL_ADLS_CONTAINER_NAME}'" |   .azureTenantID = "'${AZURE_TENANT_ID}'" | .artifactoryRepo = "'${ARTIFACTORY_REPO}'"'  values.yaml  
+                                    cat values.yaml
+                                '''
+                            }
+                        }
+                        
+                        if (params.InstallORupgrade) {
+                            echo 'Update HELM values for chart - anvil-batch'
+                            dir('anvil-umbrella/anvil-core/anvil-env-deploy/chart/anvil-batch') {
+                                sh '''  
+                                    set +x
+                                    ls -lrth	
+                                    echo "This is before $JAVA_CLI_OPTIONS"
+								    JAVA_CLI_OPTIONS=$( echo $JAVA_CLI_OPTIONS | tr -s ',' ' ')
+								    echo $JAVA_CLI_OPTIONS
+                                    yq -i e '.jobSuffix = "'${K8S_JOB_SUFFIX}'" |  .azureTenantID = "'${AZURE_TENANT_ID}'" | .tenantID = "'${ANVIL_TENANT_ID}'" |  .imageTag = "'${DOCKER_IMAGE_TAG}'" | .storageAccount = "'${ANVIL_ADLS_ACCOUNT_NAME}'" |  .anvilContainerName = "'${ANVIL_ADLS_CONTAINER_NAME}'" | .keyVaultName = "'${KEYVAULT_NAME}'" | .environment = "'${ANVIL_ENVIRONMENT}'" | .artifactoryRepo = "'${ARTIFACTORY_REPO}'"'  values.yaml						
+                                    sed -i "s/^javaOptions:.*/javaOptions: '${JAVA_CLI_OPTIONS}'/" values.yaml;  
+                                    cat values.yaml
+                                '''
+                            }
+                        }
+                        
+                        
+                    }
+                }    
+            }    
+            }
+        }   
+		stage ('Create namespace and artifactory secret') {
+            steps {
+                script {
+                withCredentials([azureServicePrincipal('hibiscus-anvil-ci')]) {
+                     dir('anvil-umbrella/anvil-core/anvil-env-deploy/chart/') {
+                    sh '''
+						az login --service-principal -u $AZURE_CLIENT_ID -p=$AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID -o none
+						az account set --subscription sb-hi-dev
+                        az aks get-credentials --resource-group "${AKS_CLUSTER_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" --overwrite-existing
+                        kubelogin convert-kubeconfig -l spn --client-id $AZURE_CLIENT_ID --client-secret $AZURE_CLIENT_SECRET                        
+                        if [ "${K8S_VOLS_DEPLOY}" = "true" ] 
+                            then
+                                echo 'Create Kubernetes CSI ADLS volume and CSI Azure key-vault secret-provider resources' 
+                                kubectl create namespace "${K8S_NAMESPACE}" --dry-run=client -o yaml |  kubectl apply -f -
+                                helm3 upgrade --install anvil-env-"${ANVIL_TENANT_ID}" anvil-env-deploy --namespace "${K8S_NAMESPACE}"
+                            fi;
+                    '''
+                     }
+                }
+				withCredentials([usernamePassword(credentialsId: 'f-anvil-deploy-artifactory', usernameVariable: 'username', passwordVariable: 'password')]) {
+					sh '''
+                        if [ -z "$(kubectl get secret anvil-artifactory-secret -n ${K8S_NAMESPACE})" ]; then
+                        	echo "no artifactory secret, creating ...."
+                        	kubectl create secret docker-registry --dry-run=client -o yaml anvil-artifactory-secret   --docker-server=artifactory.commops.merative.com  --docker-username=$username --docker-password=$password --docker-email=pchawda@merative.com --namespace ${K8S_NAMESPACE} |  kubectl apply -f -
+                        fi
+					'''
+				}   
+            }                
+            }
+        }
+      
+        
+        stage ('HELM Deployment') {
+            
+            steps {
+                script{
+                    if(params.cd) {
+                        dir('anvil-umbrella/anvil-core/anvil-env-deploy/chart/') {                    
+                            withCredentials([azureServicePrincipal('hibiscus-anvil-ci')]) {
+                                sh '''
+                                    set +x
+                                    echo "t1"
+                                    az login --service-principal -u $AZURE_CLIENT_ID -p=$AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID -o none
+                                    echo "t2"
+                                    az aks get-credentials --resource-group "${AKS_CLUSTER_RESOURCE_GROUP}" --name "${AKS_CLUSTER}" --overwrite-existing
+                                    echo "t3"
+                                    kubelogin convert-kubeconfig -l spn --client-id $AZURE_CLIENT_ID --client-secret $AZURE_CLIENT_SECRET
+                                    echo "t4"
+                                                            
+                                    
+
+
+                                    if [ "${InstallORupgrade}" = "ANVIL_BATCH_RUN_INSTALL" ]
+                                    then
+                                        echo 'Create Kubernetes job resource' 
+                                        helm3 upgrade --install anvil-batch-"${ANVIL_TENANT_ID}" anvil-batch --namespace "${K8S_NAMESPACE}"
+                                        
+                                        kubectl config set-context --current --namespace="${K8S_NAMESPACE}"
+                                        kubectl wait --for=condition=ready pod -l job-name="hibi-${ANVIL_ENVIRONMENT}-job-${ANVIL_TENANT_ID}-${K8S_JOB_SUFFIX}" --timeout="${K8S_JOB_WAIT_TIME}m" || echo "Job pods didn't run within configured wait time - ${K8S_JOB_WAIT_TIME} minute(s)."
+                                        
+                                        echo "Streaming Kubernetes job logs:"
+                                        kubectl logs -f "job/hibi-${ANVIL_ENVIRONMENT}-job-${ANVIL_TENANT_ID}-${K8S_JOB_SUFFIX}"
+                                    fi;
+
+                                    if [ "${InstallORupgrade}" = "ANVIL_BATCH_RUN_UPGRADE" ]
+                                    then
+                                        echo 'Create Kubernetes job resource' 
+                                        helm3 upgrade --install anvil-batch-"${ANVIL_TENANT_ID}" anvil-batch --namespace "${K8S_NAMESPACE}"
+                                        
+                                        kubectl config set-context --current --namespace="${K8S_NAMESPACE}"
+                                        kubectl wait --for=condition=ready pod -l job-name="hibi-${ANVIL_ENVIRONMENT}-job-${ANVIL_TENANT_ID}-${K8S_JOB_SUFFIX}" --timeout="${K8S_JOB_WAIT_TIME}m" || echo "Job pods didn't run within configured wait time - ${K8S_JOB_WAIT_TIME} minute(s)."
+                                        
+                                        echo "Streaming Kubernetes job logs:"
+                                        kubectl logs -f "job/hibi-${ANVIL_ENVIRONMENT}-job-${ANVIL_TENANT_ID}-${K8S_JOB_SUFFIX}"
+                                    fi;
+
+                                    if [ "${InstallORupgrade}" = "ANVIL_BATCH_RUN_CUSTOM" ]
+                                    then
+                                        echo 'Create Kubernetes job resource' 
+                                        helm3 upgrade --install anvil-batch-"${ANVIL_TENANT_ID}" anvil-batch --namespace "${K8S_NAMESPACE}"
+                                        
+                                        kubectl config set-context --current --namespace="${K8S_NAMESPACE}"
+                                        kubectl wait --for=condition=ready pod -l job-name="hibi-${ANVIL_ENVIRONMENT}-job-${ANVIL_TENANT_ID}-${K8S_JOB_SUFFIX}" --timeout="${K8S_JOB_WAIT_TIME}m" || echo "Job pods didn't run within configured wait time - ${K8S_JOB_WAIT_TIME} minute(s)."
+                                        
+                                        echo "Streaming Kubernetes job logs:"
+                                        kubectl logs -f "job/hibi-${ANVIL_ENVIRONMENT}-job-${ANVIL_TENANT_ID}-${K8S_JOB_SUFFIX}"
+                                    fi;
+
+                                '''
+                            }                                        
+                    
+                        }
+                    }                   
+            }
+        }
+        }
+
+        stage('Kyvos Polling') {
+            steps {
+                script {
+                    dir('anvil-umbrella')   { 
+                    withCredentials([azureServicePrincipal('hibiscus-anvil-ci')]) {
+                    
+                    sh '''
+                        set +x
+                
+                        az login --service-principal -u $AZURE_CLIENT_ID -p=$AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID -o none
+                        export client_id=$(az keyvault secret show --name AZURE-CLIENT-ID --vault-name "${KEYVAULT_NAME}"  --query "value" -o tsv)
+                        export client_secret=$(az keyvault secret show --name AZURE-CLIENT-SECRET --vault-name "${KEYVAULT_NAME}"  --query "value" -o tsv)
+                        export vault_name="${KEYVAULT_NAME}"
+                        export cube_id="${ANVIL_TENANT_ID}"
+                        set -x
+                        if [[ "${JAVA_CLI_OPTIONS}" == *"-bcube"* ]]; then
+                            echo "=====================Fetching Cube Status================="                           
+                            python3 -u cubeStatus1.py
+                        fi
+
+                        echo "===================EXITING PIPELINE========================="
+                        
+                        
+                        
+
+		           '''
+                    }
+                    }
+                }  
+            }
+                }
+            }
+        }
+    
+
+    
